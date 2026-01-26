@@ -186,13 +186,14 @@
 
     // 2. 서버의 게임 상태 업데이트 수신
     socket.on('update_game', function(data) {
-        console.log("데이터 수신:", data);
-
-        // 무한 새로고침 방지 플래그 확인 후 새로고침
-        if (!window.isReloading) {
-            window.isReloading = true;
-            location.reload(); 
-        }
+    console.log("실시간 데이터 수신:", data);
+    
+    // 1. 페이지 전체를 새로고침(reload)하는 대신, 
+    //    이미 만들어둔 syncGameState 함수만 실행해서 화면을 갱신합니다.
+    syncGameState(data.players, data.turn_idx, data.winner_result);
+    
+    // 2. (추가) 필요한 경우 카드나 팟(Pot) 금액도 JS로 업데이트하는 로직을 여기에 넣으면 됩니다.
+    document.querySelector('.pot-display').innerText = `POT: $${data.pot}`;
     });
 
     // 3. UI 제어: 내 카드만 보여주고, 내 차례가 아니면 베팅 차단
