@@ -304,6 +304,28 @@ def handle_action(data):
     else:
         broadcast_game_state()
 
+# app.py 하단에 추가
+@socketio.on('reset_game')
+def handle_reset():
+    global player_list, community_cards, winner_result, pot, high_bet
+    
+    # 1. 모든 플레이어의 칩을 초기값(5000)으로 리셋
+    for p in player_list:
+        p.chips = 5000
+        p.hand = []
+        p.is_folded = False
+        p.is_all_in = False
+        p.status = 'waiting'
+        
+    # 2. 게임판 상태 초기화
+    community_cards = []
+    winner_result = "게임이 초기화되었습니다. 다시 시작해주세요."
+    pot = 0
+    high_bet = 0
+    
+    print("게임 리셋됨")
+    broadcast_game_state()
+
 def process_round_end(active_players):
     global community_cards, high_bet, turn_idx, pot
     
