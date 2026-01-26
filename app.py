@@ -1,0 +1,375 @@
+from flask import Flask, render_template, request
+from flask_socketio import SocketIO, emit
+import random   
+import itertools
+import uuid
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'poker_secret_1234'
+# 소켓 객체 생성 (실시간 통신 담당)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+class Card:
+    def __init__(self, suit, rank):
+        self.suit = suit
+        self.rank = rank
+    def __repr__(self):
+        ranks = {11: 'J', 12: 'Q', 13: 'K', 14: 'A'}
+        r = ranks.get(self.rank, str(self.rank))
+        return f"{self.suit}{r}"
+    
+class Deck:
+    def __init__(self):
+        self.deck = [Card(s, r) for s in ["♠", "♥", "♦", "♣"] for r in range(2, 15)] 
+        random.shuffle(self.deck)
+    def deal(self):
+        return self.deck.pop()
+    
+class Player:
+    def __init__(self, name, chips, sid, p_uuid):
+        self.name = name
+        self.chips = chips
+        self.sid = sid
+        self.uuid = p_uuid # 고유 식별자 저장
+        self.hand = []
+        self.bet_this_round = 0
+        self.total_bet = 0 
+        self.is_folded = False
+        self.is_all_in = False
+        self.has_acted = False
+        self.chips_at_start = chips 
+        self.current_hand_name = ""
+        self.pos_name = ""
+        self.last_action = ""
+        self.status = 'waiting'
+
+    def bet(self, amount):
+        if amount >= self.chips:
+            amount = self.chips
+            self.is_all_in = True 
+        self.chips -= amount
+        self.bet_this_round += amount
+        self.total_bet += amount 
+        return amount
+
+    def to_dict(self):
+        """클라이언트로 전송하기 위해 객체 정보를 딕셔너리로 변환"""
+        round_profit = self.chips - self.chips_at_start
+        return {
+            'uuid': self.uuid, # ID를 포함시켜서 클라이언트가 확인할 수 있게 함
+            'name': self.name,
+            'chips': self.chips,
+            'round_profit': round_profit,
+            'hand': [str(c) for c in self.hand],
+            'bet_this_round': self.bet_this_round,
+            'is_folded': self.is_folded,
+            'is_all_in': self.is_all_in,
+            'has_acted': self.has_acted,
+            'chips_at_start': self.chips_at_start,
+            'pos_name': self.pos_name,
+            'status': self.status,
+            'current_hand_name': self.current_hand_name
+        }
+    
+class PotManager:
+    def calculate_side_pots(self, players):
+        pots = [] 
+        active_bettors = sorted([p for p in players if p.total_bet > 0], key=lambda p: p.total_bet)
+        last_level = 0
+        for i, p in enumerate(active_bettors):
+            if p.total_bet > last_level:
+                amount = sum(min(p2.total_bet - last_level, p.total_bet - last_level) 
+                             for p2 in active_bettors if p2.total_bet > last_level)
+                eligible = [p2.name for p2 in active_bettors[i:] if not p2.is_folded]
+                if eligible: pots.append({'amount': amount, 'eligible': eligible})
+                last_level = p.total_bet
+        return pots
+    
+class HandEvaluator:
+    HAND_NAMES = {8: "스트레이트 플러쉬", 7: "포카드", 6: "풀하우스", 5: "플러쉬", 4: "스트레이트", 3: "트리플", 2: "투페어", 1: "원페어", 0: "하이카드"}
+    def evaluate_5_cards(self, cards):
+        ranks = sorted([c.rank for c in cards], reverse=True)
+        suits = [c.suit for c in cards]
+        rank_counts = {r: ranks.count(r) for r in set(ranks)}
+        counts = sorted(rank_counts.values(), reverse=True)
+        is_flush = len(set(suits)) == 1
+        is_straight = len(set(ranks)) == 5 and (max(ranks) - min(ranks) == 4)
+        if not is_straight and set(ranks) == {14, 5, 4, 3, 2}:
+            is_straight = True
+            ranks = [5, 4, 3, 2, 1]
+        if is_flush and is_straight: return (8, ranks)
+        if counts == [4, 1]: return (7, sorted(rank_counts, key=lambda x: (rank_counts[x], x), reverse=True))
+        if counts == [3, 2]: return (6, sorted(rank_counts, key=lambda x: (rank_counts[x], x), reverse=True))
+        if is_flush: return (5, ranks)
+        if is_straight: return (4, ranks)
+        if counts == [3, 1, 1]: return (3, sorted(rank_counts, key=lambda x: (rank_counts[x], x), reverse=True))
+        if counts == [2, 2, 1]: return (2, sorted(rank_counts, key=lambda x: (rank_counts[x], x), reverse=True))
+        if counts == [2, 1, 1, 1]: return (1, sorted(rank_counts, key=lambda x: (rank_counts[x], x), reverse=True))
+        return (0, ranks)
+    def get_best_hand(self, hole_cards, community_cards):
+        all_cards = hole_cards + community_cards
+        best_score = (-1, [])
+        for combo in itertools.combinations(all_cards, 5):
+            score = self.evaluate_5_cards(combo)
+            if score > best_score: best_score = score
+        return best_score
+
+# -------------------------------------------------------------------
+# 전역 상태 관리 변수
+# -------------------------------------------------------------------
+player_list = []
+community_cards = []
+current_deck = None
+winner_result = None
+turn_idx = 0
+high_bet = 0
+pot = 0
+dealer_idx = -1
+
+# -------------------------------------------------------------------
+# 유틸리티 및 실시간 통신 함수
+# -------------------------------------------------------------------
+
+def broadcast_game_state():
+    """모든 클라이언트에게 실시간으로 게임 정보를 전송합니다."""
+    state = {
+        'players': [p.to_dict() for p in player_list],
+        'community': [str(c) for c in community_cards],
+        'pot': pot,
+        'high_bet': high_bet,
+        'turn_idx': turn_idx % len(player_list) if player_list else 0,
+        'winner_result': winner_result
+    }
+    socketio.emit('update_game', state)
+
+def change_rank_to_str(rank):
+    """숫자 랭크를 A, K, Q, J 등의 문자로 변환합니다."""
+    rank_dict = {11: 'J', 12: 'Q', 13: 'K', 14: 'A'}
+    return str(rank_dict.get(rank, rank))
+
+# -------------------------------------------------------------------
+# 라우트 및 소켓 이벤트 핸들러
+# -------------------------------------------------------------------
+
+@app.route('/')
+def index():
+    # Jinja2 템플릿에 데이터 전송
+    players_data = [p.to_dict() for p in player_list]
+    return render_template('index.html', 
+                           players=players_data, 
+                           community=[str(c) for c in community_cards], 
+                           pot=pot,
+                           winner_result=winner_result, 
+                           turn_idx=turn_idx, 
+                           high_bet=high_bet)
+
+@socketio.on('join_game')
+def handle_join(data):
+    global player_list # 함수 최상단에 global 선언 (SyntaxError 방지)
+    
+    name = data.get('player_name', '').strip()
+    client_uuid = data.get('p_uuid')
+    current_sid = request.sid
+
+    # 1. 중복 가입 체크 (UUID 기준)
+    if client_uuid and any(p.uuid == client_uuid for p in player_list):
+        print(f"가입 거부: {name} (이미 가입된 창입니다)")
+        return
+
+    # 2. 신규 가입 처리
+    if name and len(player_list) < 6:
+        new_uuid = str(uuid.uuid4()) # 새로운 고유 ID 발급
+        new_player = Player(name, 5000, current_sid, new_uuid)
+        player_list.append(new_player)
+        
+        print(f"새 플레이어: {name} (UUID: {new_uuid})")
+        
+        # 가입 성공한 본인에게만 UUID를 전송
+        emit('join_success', {'p_uuid': new_uuid}, room=current_sid)
+        broadcast_game_state()
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    global player_list
+    # 연결이 끊긴 sid를 가진 플레이어를 목록에서 제거 (주의: 게임 중일 때의 처리는 추후 보완 가능)
+    # player_list = [p for p in player_list if p.sid != request.sid]
+    # broadcast_game_state()
+    pass
+
+@socketio.on('start_game')
+def handle_start():
+    global current_deck, community_cards, winner_result, turn_idx, high_bet, player_list, dealer_idx, pot
+    
+    # 칩이 있는 플레이어만 참가
+    active_in_game = [p for p in player_list if p.chips > 0]
+    if len(active_in_game) < 2:
+        winner_result = "인원이 부족합니다 (최소 2명)"
+        broadcast_game_state()
+        return
+    
+    # 게임 초기화
+    winner_result = None
+    community_cards = []
+    current_deck = Deck()
+    pot = 0
+    high_bet = 200
+    
+    num_p = len(player_list)
+    dealer_idx = (dealer_idx + 1) % num_p
+    sb_idx = (dealer_idx + 1) % num_p
+    bb_idx = (dealer_idx + 2) % num_p
+    
+    # 헤즈업(2인) 처리
+    if num_p == 2:
+        sb_idx = dealer_idx
+        bb_idx = (dealer_idx + 1) % 2
+        turn_idx = sb_idx
+    else:
+        turn_idx = (dealer_idx + 3) % num_p
+
+    for i, p in enumerate(player_list):
+        p.hand = [current_deck.deal(), current_deck.deal()]
+        p.bet_this_round = p.total_bet = 0
+        p.is_all_in = p.is_folded = p.has_acted = False
+        p.chips_at_start = p.chips
+        p.current_hand_name = p.last_action = ''
+        p.pos_name = 'D' if i == dealer_idx else ('SB' if i == sb_idx else ('BB' if i == bb_idx else ''))
+        p.status = 'waiting'
+        if i == sb_idx: pot += p.bet(100)
+        elif i == bb_idx: pot += p.bet(200)
+
+    broadcast_game_state()
+
+@socketio.on('player_action')
+def handle_action(data):
+    global turn_idx, high_bet, pot, community_cards, winner_result
+
+    # 1. 보낸 사람의 UUID 확인
+    client_uuid = data.get('p_uuid')
+    current_player = player_list[turn_idx % len(player_list)]
+    
+    # 내 차례가 아니거나 UUID가 다르면 무시
+    if current_player.uuid != client_uuid:
+        print(f"권한 없음: {client_uuid}가 {current_player.name}의 차례를 가로채려 함")
+        return
+    
+    action_type = data.get('type')
+    p = player_list[turn_idx % len(player_list)]
+    p.has_acted = True
+
+    if action_type == 'fold':
+        p.is_folded = True
+        p.status = 'Fold'
+    elif action_type == 'allin':
+        pot += p.bet(p.chips)
+        p.status = 'All-In'
+        if p.bet_this_round > high_bet:
+            high_bet = p.bet_this_round
+            for op in player_list:
+                if op != p: op.has_acted = False
+    elif action_type == 'raise':
+        try:
+            target = int(data.get('amount'))
+            pot += p.bet(target - p.bet_this_round)
+            high_bet = p.bet_this_round
+            for op in player_list:
+                if op != p: op.has_acted = False
+            p.status = 'Raise'
+        except:
+            p.has_acted = False
+            return
+    else: # Call or Check
+        diff = high_bet - p.bet_this_round
+        p.status = 'Check' if diff == 0 else 'Call'
+        pot += p.bet(diff)
+
+    active_players = [p for p in player_list if not p.is_folded]
+    
+    # 기권 승 처리
+    if len(active_players) == 1:
+        winner_result = f'{active_players[0].name} 승리! (상대 기권)'
+        active_players[0].chips += pot
+        broadcast_game_state()
+        return
+
+    # 턴 넘기기 및 라운드 종료 확인
+    while True:
+        turn_idx += 1
+        next_p = player_list[turn_idx % len(player_list)]
+        round_over = all(p.is_all_in or (p.bet_this_round == high_bet and p.has_acted) for p in active_players)    
+        if round_over or (not next_p.is_folded and not next_p.is_all_in): break
+
+    if round_over:
+        process_round_end(active_players)
+    else:
+        broadcast_game_state()
+
+def process_round_end(active_players):
+    global community_cards, high_bet, turn_idx, pot
+    
+    not_all_in = [p for p in active_players if not p.is_all_in]
+    
+    # 올인 상태로 인해 바로 쇼다운 가야 하는 경우
+    if len(not_all_in) <= 1:
+        while len(community_cards) < 5: 
+            community_cards.append(current_deck.deal())
+        run_showdown()
+        return
+
+    # 베팅 정보 초기화
+    for p in player_list:
+        p.bet_this_round = 0
+        p.has_acted = False
+        p.status = 'waiting'
+    high_bet = 0
+    turn_idx = (dealer_idx + 1) % len(player_list)
+    while player_list[turn_idx % len(player_list)].is_folded: 
+        turn_idx += 1
+
+    # 다음 카드 공개
+    if len(community_cards) == 0: # Flop
+        for _ in range(3): community_cards.append(current_deck.deal())
+    elif len(community_cards) < 5: # Turn/River
+        community_cards.append(current_deck.deal())
+    else: # Showdown
+        run_showdown()
+        return
+        
+    broadcast_game_state()
+
+def run_showdown():
+    global winner_result, pot
+    pm = PotManager()
+    eval = HandEvaluator()
+    
+    # 사이드 팟 계산 및 분배 로직
+    side_pots = pm.calculate_side_pots(player_list)
+    for pot_info in side_pots:
+        p_best = (-1, [])
+        p_winners = []
+        for name in pot_info['eligible']:
+            p = next(p for p in player_list if p.name == name)
+            s = eval.get_best_hand(p.hand, community_cards)
+            if s > p_best: p_best = s ; p_winners = [p]
+            elif s == p_best: p_winners.append(p)
+
+        share = pot_info['amount'] // len(p_winners)
+        for w in p_winners: w.chips += share
+
+    # 승자 선정 및 메시지 구성
+    active = [p for p in player_list if not p.is_folded]
+    top_score = (-1, [])
+    top_winners = []
+    for p in active:
+        score = eval.get_best_hand(p.hand, community_cards)
+        p.current_hand_name = f"{change_rank_to_str(score[1][0])} {eval.HAND_NAMES[score[0]]}"
+        if score > top_score: top_score = score; top_winners = [p.name]
+        elif score == top_score: top_winners.append(p.name)   
+    
+    winner_result = f'{", ".join(top_winners)} 승리! ({change_rank_to_str(top_score[1][0])} {eval.HAND_NAMES[top_score[0]]})'
+    broadcast_game_state()
+
+if __name__ == '__main__':
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    socketio.run(app, host='0.0.0.0', port=port)
