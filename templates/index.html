@@ -154,6 +154,7 @@
         {% if players|length >= 2 %}
             {% if not players[0].hand or winner_result %}
                 <button id="deal_button" onclick="startGame()" class="btn" style="display: none; background: #27ae60; font-size: 1.2em;">DEAL NEW HAND</button>
+                <button id="reset_button" onclick="resetGame()" class="btn" style="display: none; background: #c0392b;">전체 칩 초기화 (RESET)</button>
             {% else %}
                 <div style="display: flex; gap: 10px; justify-content: center; align-items: center;">
                     <button onclick="sendAction('call')" class="btn" style="background: var(--orange);">CALL / CHECK</button>
@@ -197,67 +198,87 @@
     });
 
     // 3. UI 제어: 내 카드만 보여주고, 내 차례가 아니면 베팅 차단
-    function syncGameState(players, turnIdx, winnerResult) {
-        const myUuid = sessionStorage.getItem('poker_player_uuid');
-        
-        // (A) 가입창 제어
-        const joinSection = document.getElementById('join_section');
-        if (joinSection) {
-            const isAlreadyJoined = players.some(p => p.uuid === myUuid);
-            joinSection.style.display = isAlreadyJoined ? 'none' : 'block';
-        }
-        // (B) 방장(첫 번째 플레이어) 전용 버튼 제어 로직 추가
-        const dealBtn = document.getElementById('deal_button');
-        if (dealBtn && players.length > 0) {
-        // 1. 첫 번째 플레이어의 UUID와 내 UUID가 일치하는지 확인
-        const isHost = players[0].uuid === myUuid;
-        
-        // 2. 게임이 끝났거나 아직 시작 전인지 확인
-        const needsNewHand = !players[0].hand || players[0].hand.length === 0 || winnerResult;
+   /**
+ * 서버의 실시간 상태를 UI에 반영하는 함수
+ * @param {Array} players - 플레이어 객체 배열
+ * @param {number} turnIdx - 현재 차례인 플레이어의 인덱스
+ * @param {string} winnerResult - 승자 결과 메시지 (없으면 null/empty)
+ */
+function syncGameState(players, turnIdx, winnerResult) {
+    const myUuid = sessionStorage.getItem('poker_player_uuid');
+    
+    // 1. 방장 여부 확인 (첫 번째 플레이어가 방장 권한을 가짐)
+    const isHost = players.length > 0 && players[0].uuid === myUuid;
 
-        // 방장이고 새 게임이 필요한 상태라면 버튼 표시
-        if (isHost && needsNewHand) {
-            dealBtn.style.display = 'inline-block';
+    // 2. 가입창(Join Section) 제어
+    const joinSection = document.getElementById('join_section');
+    if (joinSection) {
+        const isAlreadyJoined = players.some(p => p.uuid === myUuid);
+        joinSection.style.display = isAlreadyJoined ? 'none' : 'block';
+    }
+
+    // 3. 방장 전용 버튼 제어 (DEAL 및 RESET)
+    const dealBtn = document.getElementById('deal_button');
+    const resetBtn = document.getElementById('reset_button'); // 새로 추가된 버튼 ID
+
+    if (isHost) {
+        // (A) 새 게임 시작(DEAL) 버튼: 게임 시작 전이거나 승자가 발표된 경우 표시
+        const needsNewHand = players.length >= 2 && (!players[0].hand || players[0].hand.length === 0 || winnerResult);
+        if (dealBtn) dealBtn.style.display = needsNewHand ? 'inline-block' : 'none';
+
+        // (B) 전체 리셋(RESET) 버튼: 파산 등으로 게임이 멈췄거나 승자 발표 시 표시
+        const activePlayersCount = players.filter(p => p.chips > 0).length;
+        if (resetBtn) {
+            // 인원이 부족하여 게임을 시작할 수 없거나, 결과가 나온 상태에서 방장에게 노출
+            resetBtn.style.display = (activePlayersCount < 2 || winnerResult) ? 'inline-block' : 'none';
+        }
+    } else {
+        // 방장이 아니면 제어 버튼들을 숨김
+        if (dealBtn) dealBtn.style.display = 'none';
+        if (resetBtn) resetBtn.style.display = 'none';
+    }
+
+    // 4. 내 차례(Turn) 여부에 따른 컨트롤 바 활성화
+    const controlBar = document.querySelector('.control-bar');
+    if (controlBar && players.length > 0) {
+        const currentTurnPlayer = players[turnIdx % players.length];
+        const isMyTurn = currentTurnPlayer && currentTurnPlayer.uuid === myUuid;
+        
+        // 결과가 나왔을 때는 새 게임 준비를 위해 활성화, 평소에는 내 차례일 때만 클릭 가능
+        if (!winnerResult && players.some(p => p.hand && p.hand.length > 0)) {
+            controlBar.style.opacity = isMyTurn ? "1" : "0.4";
+            controlBar.style.pointerEvents = isMyTurn ? "auto" : "none";
         } else {
-            dealBtn.style.display = 'none';
+            controlBar.style.opacity = "1";
+            controlBar.style.pointerEvents = "auto";
         }
     }
-        // (B) 내 차례가 아니면 컨트롤 바 비활성화
-        const controlBar = document.querySelector('.control-bar');
-        if (controlBar && players.length > 0) {
-            const currentTurnPlayer = players[turnIdx % players.length];
-            const isMyTurn = currentTurnPlayer && currentTurnPlayer.uuid === myUuid;
+
+    // 5. 카드 마스킹 (안개 시스템: 내 카드만 보이고 남의 카드는 숨김)
+    document.querySelectorAll('.player-seat').forEach((seat, index) => {
+        const p = players[index];
+        if (!p || !p.hand) return;
+
+        const cardElements = seat.querySelectorAll('.card');
+        cardElements.forEach((card, cardIdx) => {
+            // 카드를 보여주는 조건: 1. 내 카드이거나, 2. 게임 결과 발표(Showdown) 시 기권하지 않은 사람
+            const shouldShow = (p.uuid === myUuid) || (winnerResult && !p.is_folded);
             
-            // 결과가 나왔을 때는 다시 버튼 활성화(새 게임 시작용), 평소에는 내 차례일 때만 활성화
-            if (!winnerResult && players[0].hand.length > 0) {
-                controlBar.style.opacity = isMyTurn ? "1" : "0.3";
-                controlBar.style.pointerEvents = isMyTurn ? "auto" : "none";
+            if (!shouldShow) {
+                card.innerText = '??';
+                card.style.background = '#34495e'; // 카드 뒷면 색상
+                card.style.color = '#34495e';      // 텍스트 숨기기
+                card.classList.remove('red', 'black');
             } else {
-                controlBar.style.opacity = "1";
-                controlBar.style.pointerEvents = "auto";
+                // 내 카드거나 공개된 카드는 원래 스타일 유지
+                const cardValue = p.hand[cardIdx];
+                card.innerText = cardValue;
+                card.style.background = 'white';
+                card.style.color = (cardValue.includes('♥') || cardValue.includes('♦')) ? '#e74c3c' : '#2c3e50';
             }
-        }
-
-        // (C) 카드 마스킹 (안개 시스템)
-        document.querySelectorAll('.player-seat').forEach((seat, index) => {
-            const p = players[index];
-            if (!p || !p.hand) return;
-
-            const cardElements = seat.querySelectorAll('.card');
-            cardElements.forEach(card => {
-                // 보여주는 조건: 1.내 카드이거나 2.쇼다운 상황인데 기권하지 않은 플레이어인 경우
-                const shouldShow = (p.uuid === myUuid) || (winnerResult && !p.is_folded);
-                
-                if (!shouldShow) {
-                    card.innerText = '??';
-                    card.style.background = '#34495e'; // 카드 뒷면 색상
-                    card.style.color = '#34495e';      // 글자 숨기기
-                    card.classList.remove('red', 'black');
-                }
-            });
         });
-    }
-
+    });
+}
     // 4. 가입 요청 (기존 UUID 포함)
     function joinGame() {
         const nameInput = document.getElementById('new_player_name');
@@ -276,6 +297,13 @@
     // 5. 게임 시작 요청
     function startGame() {
         socket.emit('start_game');
+    }
+
+    // 서버에 리셋 요청 전송
+    function resetGame() {
+        if (confirm("모든 플레이어의 칩을 5000으로 초기화할까요?")) {
+            socket.emit('reset_game');
+        }
     }
 
     // 6. 액션 전송 시 보안을 위해 UUID 포함
