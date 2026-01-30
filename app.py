@@ -265,6 +265,14 @@ def handle_action(data):
     if round_over: process_round_end(active_players)
     else: broadcast_game_state()
 
+@socketio.on('disconnect')
+def handle_disconnect():
+    global player_list
+    # 연결이 끊긴 sid를 가진 플레이어를 자동으로 목록에서 제거
+    # (주의: 잠시 인터넷이 끊겼을 때도 나갈 수 있으므로 친구들과 할 때는 이 로직이 정확함)
+    player_list = [p for p in player_list if p.sid != request.sid]
+    broadcast_game_state()
+
 def process_round_end(active_players):
     global community_cards, high_bet, turn_idx, pot
     not_all_in = [p for p in active_players if not p.is_all_in]
