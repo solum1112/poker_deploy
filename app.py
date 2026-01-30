@@ -275,27 +275,55 @@ def handle_disconnect():
 
 def process_round_end(active_players):
     global community_cards, high_bet, turn_idx, pot
+    
+    # 1. 올인하지 않은 플레이어가 1명 이하인 경우 (쇼다운 상황 연출)
     not_all_in = [p for p in active_players if not p.is_all_in]
+    
     if len(not_all_in) <= 1:
-        while len(community_cards) < 5: community_cards.append(current_deck.deal())
+        # 커뮤니티 카드가 5장이 될 때까지 한 장씩 공개
+        while len(community_cards) < 5:
+            # 1.5초 대기 (모든 플레이어가 화면을 주목하게 함)
+            eventlet.sleep(1.5) 
+            
+            # 카드 한 장 추가
+            community_cards.append(current_deck.deal())
+            
+            # 한 장 추가될 때마다 즉시 모든 클라이언트에 전송하여 화면 갱신
+            broadcast_game_state()
+            print(f"시스템: 올인 쇼다운 카드 공개 -> {community_cards[-1]}")
+            
+        # 모든 카드가 공개되면 1초 뒤 최종 승자 판정
+        eventlet.sleep(1)
         run_showdown()
         return
+
+    # 2. 일반적인 라운드 종료 (베팅이 계속 가능한 상태)
+    # 다음 라운드를 위해 베팅 정보 및 상태 초기화
     for p in player_list:
         p.bet_this_round = 0
         p.has_acted = False
         p.status = 'waiting'
+    
     high_bet = 0
+    # 딜러 다음 사람부터 턴 시작 (기권자 제외)
     turn_idx = (dealer_idx + 1) % len(player_list)
-    while player_list[turn_idx % len(player_list)].is_folded: turn_idx += 1
-    if len(community_cards) == 0:
+    while player_list[turn_idx % len(player_list)].is_folded: 
+        turn_idx += 1
+
+    # 현재 깔린 카드 수에 따라 다음 단계 진행
+    if len(community_cards) == 0: 
+        # Flop: 3장 한꺼번에 공개
         for _ in range(3): community_cards.append(current_deck.deal())
-    elif len(community_cards) < 5:
+    elif len(community_cards) < 5: 
+        # Turn 또는 River: 1장 공개
         community_cards.append(current_deck.deal())
-    else:
+    else: 
+        # 모든 카드가 이미 다 깔렸다면 결과 발표
         run_showdown()
         return
+        
+    # 변경된 보드 상태 전송
     broadcast_game_state()
-
 def run_showdown():
     global winner_result, pot
     pm = PotManager()
